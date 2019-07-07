@@ -18,15 +18,23 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import functools
-import itertools
+import concurrent
+import copy
+import glob
+import os
+import random
 import sys
 
+from tqdm import tqdm
+
+import magenta
 from magenta.models.score2perf import modalities
 from magenta.models.score2perf import music_encoders
-from magenta.music import chord_symbols_lib
+from magenta.models.score2perf.datagen_beam import DataAugmentationError, SCORE_BPM
+from magenta.music import chord_symbols_lib, chord_inference, melody_inference
 from magenta.music import sequences_lib
-from tensor2tensor.data_generators import problem
+from magenta.protobuf import music_pb2
+from tensor2tensor.data_generators import problem, generator_utils
 from tensor2tensor.layers import modalities as t2t_modalities
 from tensor2tensor.models import transformer
 from tensor2tensor.utils import registry
@@ -117,50 +125,267 @@ class Score2PerfProblem(problem.Problem):
     """Input performances beam transform (or dictionary thereof) for datagen."""
     raise NotImplementedError()
 
-  def generate_data(self, data_dir, tmp_dir, task_id=-1):
-    del task_id
+  @staticmethod
+  def process_midi(self, f):
+    self._min_hop_size_seconds = 0.0
+    self._max_hop_size_seconds = 0.0
+    self._num_replications = 1
+    self._encode_performance_fn = self.performance_encoder().encode_note_sequence
+    self._encode_score_fns = dict((name, encoder.encode_note_sequence)
+                                  for name, encoder in self.score_encoders())
+    self._augment_fns = [lambda ns: ns]
+    # self._augment_fns = [augment_note_sequence]
+    # if augment_fns else [lambda ns: ns]
+    self._absolute_timing = False
+    self._random_crop_length = None
+
+    rets = []
+    ns = magenta.music.midi_file_to_sequence_proto(f)
+    # Apply sustain pedal.
+    ns = sequences_lib.apply_sustain_control_changes(ns)
+
+    # Remove control changes as there are potentially a lot of them and they are
+    # no longer needed.
+    del ns.control_changes[:]
+
+    if (self._min_hop_size_seconds and
+        ns.total_time < self._min_hop_size_seconds):
+      print("sequence_too_short")
+      # Metrics.counter('extract_examples', 'sequence_too_short').inc()
+      return []
+
+    sequences = []
+    for _ in range(self._num_replications):
+      if self._max_hop_size_seconds:
+        if self._max_hop_size_seconds == self._min_hop_size_seconds:
+          # Split using fixed hop size.
+          sequences += sequences_lib.split_note_sequence(
+            ns, self._max_hop_size_seconds)
+        else:
+          # Sample random hop positions such that each segment size is within
+          # the specified range.
+          hop_times = [0.0]
+          while hop_times[-1] <= ns.total_time - self._min_hop_size_seconds:
+            if hop_times[-1] + self._max_hop_size_seconds < ns.total_time:
+              # It's important that we get a valid hop size here, since the
+              # remainder of the sequence is too long.
+              max_offset = min(
+                self._max_hop_size_seconds,
+                ns.total_time - self._min_hop_size_seconds - hop_times[-1])
+            else:
+              # It's okay if the next hop time is invalid (in which case we'll
+              # just stop).
+              max_offset = self._max_hop_size_seconds
+            offset = random.uniform(self._min_hop_size_seconds, max_offset)
+            hop_times.append(hop_times[-1] + offset)
+          # Split at the chosen hop times (ignoring zero and the final invalid
+          # time).
+          sequences += sequences_lib.split_note_sequence(ns, hop_times[1:-1])
+      else:
+        sequences += [ns]
+
+    for performance_sequence in sequences:
+      if self._encode_score_fns:
+        # We need to extract a score.
+        if not self._absolute_timing:
+          # Beats are required to extract a score with metric timing.
+          beats = [
+            ta for ta in performance_sequence.text_annotations
+            if (ta.annotation_type ==
+                music_pb2.NoteSequence.TextAnnotation.BEAT)
+               and ta.time <= performance_sequence.total_time
+          ]
+          if len(beats) < 2:
+            print('not_enough_beats')
+            # Metrics.counter('extract_examples', 'not_enough_beats').inc()
+            continue
+
+          # Ensure the sequence starts and ends on a beat.
+          performance_sequence = sequences_lib.extract_subsequence(
+            performance_sequence,
+            start_time=min(beat.time for beat in beats),
+            end_time=max(beat.time for beat in beats)
+          )
+
+          # Infer beat-aligned chords (only for relative timing).
+          try:
+            chord_inference.infer_chords_for_sequence(
+              performance_sequence,
+              chord_change_prob=0.25,
+              chord_note_concentration=50.0,
+              add_key_signatures=True)
+          except chord_inference.ChordInferenceError:
+            print("chord_inference_failed")
+            # Metrics.counter('extract_examples', 'chord_inference_failed').inc()
+            continue
+
+        # Infer melody regardless of relative/absolute timing.
+        try:
+          melody_instrument = melody_inference.infer_melody_for_sequence(
+            performance_sequence,
+            melody_interval_scale=2.0,
+            rest_prob=0.1,
+            instantaneous_non_max_pitch_prob=1e-15,
+            instantaneous_non_empty_rest_prob=0.0,
+            instantaneous_missing_pitch_prob=1e-15)
+        except melody_inference.MelodyInferenceError:
+          print('melody_inference_failed')
+          # Metrics.counter('extract_examples', 'melody_inference_failed').inc()
+          continue
+
+        if not self._absolute_timing:
+          # Now rectify detected beats to occur at fixed tempo.
+          # TODO(iansimon): also include the alignment
+          score_sequence, unused_alignment = sequences_lib.rectify_beats(
+            performance_sequence, beats_per_minute=SCORE_BPM)
+        else:
+          # Score uses same timing as performance.
+          score_sequence = copy.deepcopy(performance_sequence)
+
+        # Remove melody notes from performance.
+        performance_notes = []
+        for note in performance_sequence.notes:
+          if note.instrument != melody_instrument:
+            performance_notes.append(note)
+        del performance_sequence.notes[:]
+        performance_sequence.notes.extend(performance_notes)
+
+        # Remove non-melody notes from score.
+        score_notes = []
+        for note in score_sequence.notes:
+          if note.instrument == melody_instrument:
+            score_notes.append(note)
+        del score_sequence.notes[:]
+        score_sequence.notes.extend(score_notes)
+
+        # Remove key signatures and beat/chord annotations from performance.
+        del performance_sequence.key_signatures[:]
+        del performance_sequence.text_annotations[:]
+
+        print("extracted_score")
+        # Metrics.counter('extract_examples', 'extracted_score').inc()
+
+      for augment_fn in self._augment_fns:
+        # Augment and encode the performance.
+        try:
+          augmented_performance_sequence = augment_fn(performance_sequence)
+        except DataAugmentationError:
+          print("augment_performance_failed")
+          # Metrics.counter(
+          #   'extract_examples', 'augment_performance_failed').inc()
+          continue
+        example_dict = {
+          'targets': self._encode_performance_fn(
+            augmented_performance_sequence)
+        }
+        if not example_dict['targets']:
+          print('skipped_empty_targets')
+          # Metrics.counter('extract_examples', 'skipped_empty_targets').inc()
+          continue
+
+        if (self._random_crop_length and
+            len(example_dict['targets']) > self._random_crop_length):
+          # Take a random crop of the encoded performance.
+          max_offset = len(example_dict['targets']) - self._random_crop_length
+          offset = random.randrange(max_offset + 1)
+          example_dict['targets'] = example_dict['targets'][
+                                    offset:offset + self._random_crop_length]
+
+        if self._encode_score_fns:
+          # Augment the extracted score.
+          try:
+            augmented_score_sequence = augment_fn(score_sequence)
+          except DataAugmentationError:
+            print('augment_score_failed')
+            # Metrics.counter('extract_examples', 'augment_score_failed').inc()
+            continue
+
+          # Apply all score encoding functions.
+          skip = False
+          for name, encode_score_fn in self._encode_score_fns.items():
+            example_dict[name] = encode_score_fn(augmented_score_sequence)
+            if not example_dict[name]:
+              print('skipped_empty_%s' % name)
+              # Metrics.counter('extract_examples',
+              #                 'skipped_empty_%s' % name).inc()
+              skip = True
+              break
+          if skip:
+            continue
+
+        rets.append(example_dict)
+    return rets
+
+  def generator(self, files):
 
     def augment_note_sequence(ns, stretch_factor, transpose_amount):
       """Augment a NoteSequence by time stretch and pitch transposition."""
       augmented_ns = sequences_lib.stretch_note_sequence(
-          ns, stretch_factor, in_place=False)
+        ns, stretch_factor, in_place=False)
       try:
         _, num_deleted_notes = sequences_lib.transpose_note_sequence(
-            augmented_ns, transpose_amount,
-            min_allowed_pitch=MIN_PITCH, max_allowed_pitch=MAX_PITCH,
-            in_place=True)
+          augmented_ns, transpose_amount,
+          min_allowed_pitch=MIN_PITCH, max_allowed_pitch=MAX_PITCH,
+          in_place=True)
       except chord_symbols_lib.ChordSymbolError:
         raise datagen_beam.DataAugmentationError(
-            'Transposition of chord symbol(s) failed.')
+          'Transposition of chord symbol(s) failed.')
       if num_deleted_notes:
         raise datagen_beam.DataAugmentationError(
-            'Transposition caused out-of-range pitch(es).')
+          'Transposition caused out-of-range pitch(es).')
       return augmented_ns
 
-    augment_params = itertools.product(
-        self.stretch_factors, self.transpose_amounts)
-    augment_fns = [
-        functools.partial(augment_note_sequence,
-                          stretch_factor=s, transpose_amount=t)
-        for s, t in augment_params
-    ]
+    with concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+      future_to_url = {
+        executor.submit(self.process_midi, self, f): idx for idx, f in enumerate(files)
+      }
 
-    datagen_beam.generate_examples(
-        input_transform=self.performances_input_transform(tmp_dir),
-        output_dir=data_dir,
-        problem_name=self.dataset_filename(),
-        splits=self.splits,
-        min_hop_size_seconds=self.min_hop_size_seconds,
-        max_hop_size_seconds=self.max_hop_size_seconds,
-        min_pitch=MIN_PITCH,
-        max_pitch=MAX_PITCH,
-        num_replications=self.num_replications,
-        encode_performance_fn=self.performance_encoder().encode_note_sequence,
-        encode_score_fns=dict((name, encoder.encode_note_sequence)
-                              for name, encoder in self.score_encoders()),
-        augment_fns=augment_fns,
-        absolute_timing=self.absolute_timing,
-        random_crop_length=self.random_crop_length_in_datagen)
+    for future in tqdm(concurrent.futures.as_completed(future_to_url)):
+      idx = future_to_url[future]
+      data = future.result()
+      for d in data:
+        yield d
+
+  def generate_data(self, data_dir, tmp_dir, task_id=-1):
+    train_paths = self.training_filepaths(
+      data_dir, 10, shuffled=False)
+    dev_paths = self.dev_filepaths(
+      data_dir, 1, shuffled=True)
+
+    midi_files = glob.glob('data/maestro/raw/*.midi')
+    random.seed(13)
+    random.shuffle(midi_files)
+
+    generator_utils.generate_files(
+      self.generator(midi_files[:100]), dev_paths)
+
+    generator_utils.generate_files(
+      self.generator(midi_files[100:]), train_paths)
+    generator_utils.shuffle_dataset(train_paths)
+
+    # augment_params = itertools.product(
+    #     self.stretch_factors, self.transpose_amounts)
+    # augment_fns = [
+    #     functools.partial(augment_note_sequence,
+    #                       stretch_factor=s, transpose_amount=t)
+    #     for s, t in augment_params
+    # ]
+    # datagen_beam.generate_examples(
+    #     input_transform=self.performances_input_transform(tmp_dir),
+    #     output_dir=data_dir,
+    #     problem_name=self.dataset_filename(),
+    #     splits=self.splits,
+    #     min_hop_size_seconds=self.min_hop_size_seconds,
+    #     max_hop_size_seconds=self.max_hop_size_seconds,
+    #     min_pitch=MIN_PITCH,
+    #     max_pitch=MAX_PITCH,
+    #     num_replications=self.num_replications,
+    #     encode_performance_fn=self.performance_encoder().encode_note_sequence,
+    #     encode_score_fns=dict((name, encoder.encode_note_sequence)
+    #                           for name, encoder in self.score_encoders()),
+    #     augment_fns=augment_fns,
+    #     absolute_timing=self.absolute_timing,
+    #     random_crop_length=self.random_crop_length_in_datagen)
 
   def hparams(self, defaults, model_hparams):
     del model_hparams   # unused
