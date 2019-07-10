@@ -20,7 +20,9 @@ from __future__ import print_function
 
 import concurrent
 import copy
+import functools
 import glob
+import itertools
 import os
 import random
 import sys
@@ -40,8 +42,8 @@ from tensor2tensor.models import transformer
 from tensor2tensor.utils import registry
 import tensorflow as tf
 
-if sys.version_info.major == 2:
-  from magenta.models.score2perf import datagen_beam  # pylint:disable=g-import-not-at-top,ungrouped-imports
+# if sys.version_info.major == 2:
+from magenta.models.score2perf import datagen_beam  # pylint:disable=g-import-not-at-top,ungrouped-imports
 
 # TODO(iansimon): figure out the best way not to hard-code these constants
 
@@ -121,23 +123,47 @@ class Score2PerfProblem(problem.Problem):
     """Whether to split each eval example when preprocessing."""
     return False
 
-  def performances_input_transform(self, tmp_dir):
-    """Input performances beam transform (or dictionary thereof) for datagen."""
-    raise NotImplementedError()
-
   @staticmethod
   def process_midi(self, f):
+
+    def augment_note_sequence(ns, stretch_factor, transpose_amount):
+      """Augment a NoteSequence by time stretch and pitch transposition."""
+      augmented_ns = sequences_lib.stretch_note_sequence(
+        ns, stretch_factor, in_place=False)
+      try:
+        _, num_deleted_notes = sequences_lib.transpose_note_sequence(
+          augmented_ns, transpose_amount,
+          min_allowed_pitch=MIN_PITCH, max_allowed_pitch=MAX_PITCH,
+          in_place=True)
+      except chord_symbols_lib.ChordSymbolError:
+        raise datagen_beam.DataAugmentationError(
+          'Transposition of chord symbol(s) failed.')
+      if num_deleted_notes:
+        raise datagen_beam.DataAugmentationError(
+          'Transposition caused out-of-range pitch(es).')
+      return augmented_ns
+
     self._min_hop_size_seconds = 0.0
     self._max_hop_size_seconds = 0.0
     self._num_replications = 1
     self._encode_performance_fn = self.performance_encoder().encode_note_sequence
     self._encode_score_fns = dict((name, encoder.encode_note_sequence)
                                   for name, encoder in self.score_encoders())
-    self._augment_fns = [lambda ns: ns]
-    # self._augment_fns = [augment_note_sequence]
-    # if augment_fns else [lambda ns: ns]
-    self._absolute_timing = False
-    self._random_crop_length = None
+
+    augment_params = itertools.product(
+      self.stretch_factors, self.transpose_amounts)
+    augment_fns = [
+      functools.partial(augment_note_sequence,
+                        stretch_factor=s, transpose_amount=t)
+      for s, t in augment_params
+    ]
+
+    self._augment_fns = augment_fns
+    self._absolute_timing = self.absolute_timing
+    self._random_crop_length = self.random_crop_length_in_datagen
+    if self._random_crop_length is not None:
+      self._augment_fns = self._augment_fns
+
 
     rets = []
     ns = magenta.music.midi_file_to_sequence_proto(f)
@@ -151,7 +177,6 @@ class Score2PerfProblem(problem.Problem):
     if (self._min_hop_size_seconds and
         ns.total_time < self._min_hop_size_seconds):
       print("sequence_too_short")
-      # Metrics.counter('extract_examples', 'sequence_too_short').inc()
       return []
 
     sequences = []
@@ -197,7 +222,6 @@ class Score2PerfProblem(problem.Problem):
           ]
           if len(beats) < 2:
             print('not_enough_beats')
-            # Metrics.counter('extract_examples', 'not_enough_beats').inc()
             continue
 
           # Ensure the sequence starts and ends on a beat.
@@ -216,7 +240,6 @@ class Score2PerfProblem(problem.Problem):
               add_key_signatures=True)
           except chord_inference.ChordInferenceError:
             print("chord_inference_failed")
-            # Metrics.counter('extract_examples', 'chord_inference_failed').inc()
             continue
 
         # Infer melody regardless of relative/absolute timing.
@@ -230,7 +253,6 @@ class Score2PerfProblem(problem.Problem):
             instantaneous_missing_pitch_prob=1e-15)
         except melody_inference.MelodyInferenceError:
           print('melody_inference_failed')
-          # Metrics.counter('extract_examples', 'melody_inference_failed').inc()
           continue
 
         if not self._absolute_timing:
@@ -262,17 +284,12 @@ class Score2PerfProblem(problem.Problem):
         del performance_sequence.key_signatures[:]
         del performance_sequence.text_annotations[:]
 
-        print("extracted_score")
-        # Metrics.counter('extract_examples', 'extracted_score').inc()
-
       for augment_fn in self._augment_fns:
         # Augment and encode the performance.
         try:
           augmented_performance_sequence = augment_fn(performance_sequence)
         except DataAugmentationError:
           print("augment_performance_failed")
-          # Metrics.counter(
-          #   'extract_examples', 'augment_performance_failed').inc()
           continue
         example_dict = {
           'targets': self._encode_performance_fn(
@@ -280,7 +297,6 @@ class Score2PerfProblem(problem.Problem):
         }
         if not example_dict['targets']:
           print('skipped_empty_targets')
-          # Metrics.counter('extract_examples', 'skipped_empty_targets').inc()
           continue
 
         if (self._random_crop_length and
@@ -297,7 +313,6 @@ class Score2PerfProblem(problem.Problem):
             augmented_score_sequence = augment_fn(score_sequence)
           except DataAugmentationError:
             print('augment_score_failed')
-            # Metrics.counter('extract_examples', 'augment_score_failed').inc()
             continue
 
           # Apply all score encoding functions.
@@ -306,8 +321,6 @@ class Score2PerfProblem(problem.Problem):
             example_dict[name] = encode_score_fn(augmented_score_sequence)
             if not example_dict[name]:
               print('skipped_empty_%s' % name)
-              # Metrics.counter('extract_examples',
-              #                 'skipped_empty_%s' % name).inc()
               skip = True
               break
           if skip:
@@ -317,24 +330,6 @@ class Score2PerfProblem(problem.Problem):
     return rets
 
   def generator(self, files):
-
-    def augment_note_sequence(ns, stretch_factor, transpose_amount):
-      """Augment a NoteSequence by time stretch and pitch transposition."""
-      augmented_ns = sequences_lib.stretch_note_sequence(
-        ns, stretch_factor, in_place=False)
-      try:
-        _, num_deleted_notes = sequences_lib.transpose_note_sequence(
-          augmented_ns, transpose_amount,
-          min_allowed_pitch=MIN_PITCH, max_allowed_pitch=MAX_PITCH,
-          in_place=True)
-      except chord_symbols_lib.ChordSymbolError:
-        raise datagen_beam.DataAugmentationError(
-          'Transposition of chord symbol(s) failed.')
-      if num_deleted_notes:
-        raise datagen_beam.DataAugmentationError(
-          'Transposition caused out-of-range pitch(es).')
-      return augmented_ns
-
     with concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
       future_to_url = {
         executor.submit(self.process_midi, self, f): idx for idx, f in enumerate(files)
@@ -363,29 +358,6 @@ class Score2PerfProblem(problem.Problem):
       self.generator(midi_files[100:]), train_paths)
     generator_utils.shuffle_dataset(train_paths)
 
-    # augment_params = itertools.product(
-    #     self.stretch_factors, self.transpose_amounts)
-    # augment_fns = [
-    #     functools.partial(augment_note_sequence,
-    #                       stretch_factor=s, transpose_amount=t)
-    #     for s, t in augment_params
-    # ]
-    # datagen_beam.generate_examples(
-    #     input_transform=self.performances_input_transform(tmp_dir),
-    #     output_dir=data_dir,
-    #     problem_name=self.dataset_filename(),
-    #     splits=self.splits,
-    #     min_hop_size_seconds=self.min_hop_size_seconds,
-    #     max_hop_size_seconds=self.max_hop_size_seconds,
-    #     min_pitch=MIN_PITCH,
-    #     max_pitch=MAX_PITCH,
-    #     num_replications=self.num_replications,
-    #     encode_performance_fn=self.performance_encoder().encode_note_sequence,
-    #     encode_score_fns=dict((name, encoder.encode_note_sequence)
-    #                           for name, encoder in self.score_encoders()),
-    #     augment_fns=augment_fns,
-    #     absolute_timing=self.absolute_timing,
-    #     random_crop_length=self.random_crop_length_in_datagen)
 
   def hparams(self, defaults, model_hparams):
     del model_hparams   # unused
@@ -541,12 +513,6 @@ class LeadSheet2PerfProblem(Score2PerfProblem):
 class Score2PerfMaestroLanguageUncroppedAug(Score2PerfProblem):
   """Piano performance language model on the MAESTRO dataset."""
 
-  def performances_input_transform(self, tmp_dir):
-    del tmp_dir
-    return dict(
-        (split_name, datagen_beam.ReadNoteSequencesFromTFRecord(tfrecord_path))
-        for split_name, tfrecord_path in MAESTRO_TFRECORD_PATHS.items())
-
   @property
   def splits(self):
     return None
@@ -586,12 +552,6 @@ class Score2PerfMaestroLanguageUncroppedAug(Score2PerfProblem):
 class Score2PerfMaestroAbsMel2Perf5sTo30sAug10x(AbsoluteMelody2PerfProblem):
   """Generate performances from an absolute-timed melody, with augmentation."""
 
-  def performances_input_transform(self, tmp_dir):
-    del tmp_dir
-    return dict(
-        (split_name, datagen_beam.ReadNoteSequencesFromTFRecord(tfrecord_path))
-        for split_name, tfrecord_path in MAESTRO_TFRECORD_PATHS.items())
-
   @property
   def splits(self):
     return None
@@ -623,8 +583,67 @@ class Score2PerfMaestroAbsMel2Perf5sTo30sAug10x(AbsoluteMelody2PerfProblem):
     return [-3, -2, -1, 0, 1, 2, 3]
 
 
+@registry.register_problem('melody2perf_maestro')
+class Melody2PerfMaestro(Melody2PerfProblem):
+
+  @property
+  def absolute_timing(self):
+    return False
+
+  @property
+  def splits(self):
+    return None
+
+  @property
+  def min_hop_size_seconds(self):
+    return 0.0
+
+  @property
+  def max_hop_size_seconds(self):
+    return 0.0
+
+  @property
+  def add_eos_symbol(self):
+    return False
+
+  @property
+  def stretch_factors(self):
+    # Stretch by -5%, -2.5%, 0%, 2.5%, and 5%.
+    return [0.95, 0.975, 1.0, 1.025, 1.05]
+
+  @property
+  def transpose_amounts(self):
+    # Transpose no more than a minor third.
+    return [-3, -2, -1, 0, 1, 2, 3]
+
+  @property
+  def random_crop_in_train(self):
+    return False
+
+  @property
+  def split_in_eval(self):
+    return False
+
+  @property
+  def random_crop_length_in_datagen(self):
+    """Randomly crop targets to this length in datagen."""
+    return 2048
+
+
 @registry.register_hparams
 def score2perf_transformer_base():
   hparams = transformer.transformer_base()
+  hparams.label_smoothing = 0.0
+  hparams.max_length = 0
+  hparams.max_target_seq_length = 2048
+  hparams.batch_size = 2048
   hparams.bottom['inputs'] = modalities.bottom
+  return hparams
+
+
+@registry.register_hparams
+def score2perf_transformer_relative():
+  hparams = score2perf_transformer_base()
+  hparams.self_attention_type = "dot_product_relative_v2"
+  hparams.max_relative_position = 1024
   return hparams

@@ -48,6 +48,7 @@ def _get_weights(model_hparams, vocab_size, hidden_dim=None):
 
 def bottom_simple(x, model_hparams, vocab_size, name, reuse):
   """Internal bottom transformation."""
+  vocab_size = [vocab_size]
   with tf.variable_scope(name, reuse=reuse):
     var = _get_weights(model_hparams, vocab_size)
     x = common_layers.dropout_no_scaling(

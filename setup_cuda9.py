@@ -44,7 +44,7 @@ REQUIRED_PACKAGES = [
     'matplotlib >= 1.5.3',
     'mido == 1.2.6',
     'mir_eval >= 0.4',
-    'numpy >= 1.14.6',  # 1.14.6 is required for colab compatibility.
+    'numpy == 1.14.6',  # 1.14.6 is required for colab compatibility.
     'pandas >= 0.18.1',
     'pretty_midi >= 0.2.6',
     'protobuf >= 3.6.1',
@@ -56,17 +56,17 @@ REQUIRED_PACKAGES = [
     'sonnet',
     'sox >= 1.3.7',
     'tensorflow-datasets >= 1.0.2',
-    'tensorflow-probability == 0.6.0',
+    'tensorflow-probability == 0.5.0',
     'tensor2tensor >= 1.10.0',
     'wheel',
     'futures;python_version=="2.7"',
     'apache-beam[gcp] >= 2.8.0',
 ]
 
-if gpu_mode:
-  REQUIRED_PACKAGES.append('tensorflow-gpu == 1.13.1')
-else:
-  REQUIRED_PACKAGES.append('tensorflow == 1.13.1')
+# if gpu_mode:
+REQUIRED_PACKAGES.append('tensorflow-gpu == 1.12.3')
+# else:
+#   REQUIRED_PACKAGES.append('tensorflow == 1.13.1')
 
 # pylint:disable=line-too-long
 CONSOLE_SCRIPTS = [

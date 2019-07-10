@@ -119,6 +119,11 @@ def midi_to_note_sequence(midi_data):
     tempo.time = time_in_seconds
     tempo.qpm = tempo_in_qpm
 
+  for time in midi.get_beats():
+    annotation = sequence.text_annotations.add()
+    annotation.time = time
+    annotation.annotation_type = music_pb2.NoteSequence.TextAnnotation.BEAT
+
   # Populate notes by gathering them all from the midi's instruments.
   # Also set the sequence.total_time as the max end time in the notes.
   midi_notes = []
@@ -329,6 +334,13 @@ def note_sequence_to_pretty_midi(
                            pretty_midi.ControlChange(
                                seq_cc.control_number,
                                seq_cc.control_value, seq_cc.time))
+  for ta in sequence.text_annotations:
+    from magenta.music.chords_lib import CHORD_SYMBOL
+    if ta.annotation_type == CHORD_SYMBOL and ta.text != constants.NO_CHORD:
+      pm.lyrics.append(pretty_midi.Lyric(ta.text, ta.time))
+    # timing_track.append(mido.MetaMessage(
+    #   'end_of_track', time=timing_track[-1].time + 1))
+
 
   for (instr_id, prog_id, is_drum) in sorted(instrument_events.keys()):
     # For instr_id 0 append to the instrument created above.

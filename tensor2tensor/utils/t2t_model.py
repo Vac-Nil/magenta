@@ -50,6 +50,7 @@ from tensorflow.python.layers import base
 from tensorflow.python.ops import inplace_ops
 from tensorflow.python.ops import variable_scope
 from tensorflow.python.util import tf_inspect as inspect
+import numpy as np
 
 _no_problem_err_str = (
     "The default implementation of %s requires that the "
@@ -115,6 +116,25 @@ def _unflatten_dict(flat_dict, prefixes):
       original_dict[key] = value
 
   return original_dict
+
+
+def _log_variable_sizes(var_list, tag):
+  """Log the sizes and shapes of variables, and the total size.
+
+  Args:
+    var_list: a list of varaibles
+    tag: a string
+  """
+  name_to_var = {v.name: v for v in var_list}
+  total_size = 0
+  for v_name in sorted(list(name_to_var)):
+    v = name_to_var[v_name]
+    v_size = int(np.prod(np.array(v.shape.as_list())))
+    log_info("Weight    %s\tshape    %s\tsize    %d",
+             v.name[:-2].ljust(80),
+             str(v.shape).ljust(20), v_size)
+    total_size += v_size
+  log_info("%s Total size: %d", tag, total_size)
 
 
 class T2TModel(base.Layer):
@@ -321,6 +341,9 @@ class T2TModel(base.Layer):
       summarize_features(features, num_shards=self._num_datashards)
       sharded_features = self._shard_features(features)
       sharded_logits, losses = self.model_fn_sharded(sharded_features)
+      if not hasattr(_log_variable_sizes, 'logged_vars'):
+        _log_variable_sizes.logged_vars = True
+        _log_variable_sizes(tf.trainable_variables(), "Trainable Variables")
       if isinstance(sharded_logits, dict):
         concat_logits = {}
         for k, v in six.iteritems(sharded_logits):

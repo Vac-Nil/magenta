@@ -29,7 +29,7 @@ REST = -1
 MELODY_VELOCITY = 127
 
 # Maximum number of melody frames to infer.
-MAX_NUM_FRAMES = 10000
+MAX_NUM_FRAMES = 20000
 
 
 def _melody_transition_distribution(rest_prob, interval_prob_fn):
