@@ -24,8 +24,10 @@ set -x
 sudo apt-get update
 sudo apt-get -y install build-essential libasound2-dev libjack-dev libav-tools sox
 
-# Ensure python 3.5 is used, set up an isolated virtualenv.
-PY3_PATH="$(which python3.5)"
+# Ensure python 3.7 used, set up an isolated virtualenv.
+PY3_PATH="$(which python3.7)"
+${PY3_PATH} -m pip --version
+${PY3_PATH} -m pip install virtualenv
 ${PY3_PATH} -m virtualenv /tmp/magenta-env --python="${PY3_PATH}"
 source /tmp/magenta-env/bin/activate
 echo $(which python)
